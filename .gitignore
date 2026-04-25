@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+output/*
+!output/.gitkeep
+templates/*
+!templates/.gitkeep
+.DS_Store
+

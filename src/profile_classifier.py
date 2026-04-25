@@ -22,6 +22,8 @@ class SymbolHypothesis(NamedTuple):
     char: str
     closeness: float
     distance: float
+    profile_closeness: float = 0.0
+    profile_distance: float = 0.0
 
 @dataclass
 class RecognitionResult:
@@ -37,6 +39,7 @@ class RecognitionResult:
 class SymbolPrototype:
     char: str
     features: np.ndarray
+    profile: List[int]
 
 
 def load_font(size: int, font_path: Optional[str] = None) -> ImageFont.FreeTypeFont:
@@ -109,33 +112,110 @@ def compute_features(image: Image.Image) -> np.ndarray:
     ], dtype=float)
 
 
+def resample_1d(values: np.ndarray, target_len: int) -> np.ndarray:
+    if values.size == 0:
+        return np.zeros(target_len, dtype=float)
+    if values.size == target_len:
+        return values.astype(float, copy=False)
+    x_old = np.linspace(0.0, 1.0, num=values.size, endpoint=True)
+    x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=True)
+    return np.interp(x_new, x_old, values.astype(float, copy=False))
+
+
+def compute_profile_sequence(
+    image: Image.Image,
+    *,
+    bins: int = 32,
+    levels: int = 10,
+) -> List[int]:
+    arr = np.array(image.convert("L"), dtype=float)
+    arr = 255 - arr
+    arr = np.clip(arr, 0, 255) / 255.0
+    height, width = arr.shape
+    if height == 0 or width == 0 or arr.sum() < 1e-6:
+        return []
+
+    v = arr.sum(axis=0) / max(1.0, float(height))
+    h = arr.sum(axis=1) / max(1.0, float(width))
+    v = resample_1d(v, bins)
+    h = resample_1d(h, bins)
+
+    def quantize(x: np.ndarray) -> List[int]:
+        x = np.clip(x, 0.0, 1.0)
+        q = np.floor(x * (levels - 1e-9)).astype(int)
+        q = np.clip(q, 0, levels - 1)
+        return q.tolist()
+
+    return quantize(v) + quantize(h)
+
+
 def build_prototypes(alphabet: str, font: ImageFont.FreeTypeFont) -> List[SymbolPrototype]:
     prototypes = []
     for char in alphabet:
         char_image = render_char_image(char, font)
         feature_ring = compute_features(char_image)
-        prototypes.append(SymbolPrototype(char, feature_ring))
+        profile = compute_profile_sequence(char_image)
+        prototypes.append(SymbolPrototype(char, feature_ring, profile))
     return prototypes
 
 
-def compute_symbol_hypotheses(features: np.ndarray, prototypes: List[SymbolPrototype]) -> List[SymbolHypothesis]:
+def compute_symbol_hypotheses(
+    features: np.ndarray,
+    symbol_profile: List[int],
+    prototypes: List[SymbolPrototype],
+    *,
+    use_profiles: bool,
+    profile_weight: float,
+) -> List[SymbolHypothesis]:
     candidates: List[SymbolHypothesis] = []
     for prototype in prototypes:
         distance = float(np.linalg.norm(prototype.features - features))
         closeness = 1.0 / (1.0 + distance)
-        candidates.append(SymbolHypothesis(prototype.char, closeness, distance))
+        if use_profiles:
+            profile_distance = float(levenshtein_seq(symbol_profile, prototype.profile))
+            norm = float(max(1, max(len(symbol_profile), len(prototype.profile))))
+            profile_distance /= norm
+            profile_closeness = 1.0 / (1.0 + profile_distance)
+            closeness = (1.0 - profile_weight) * closeness + profile_weight * profile_closeness
+        else:
+            profile_closeness = 0.0
+            profile_distance = 0.0
+        candidates.append(
+            SymbolHypothesis(
+                prototype.char,
+                float(closeness),
+                float(distance),
+                float(profile_closeness),
+                float(profile_distance),
+            )
+        )
     candidates.sort(key=lambda hyp: hyp.closeness, reverse=True)
     return candidates
 
 
-def run_recognition(text: str, prototypes: List[SymbolPrototype], font: ImageFont.FreeTypeFont, spacing: int) -> RecognitionResult:
+def run_recognition(
+    text: str,
+    prototypes: List[SymbolPrototype],
+    font: ImageFont.FreeTypeFont,
+    spacing: int,
+    *,
+    use_profiles: bool,
+    profile_weight: float,
+) -> RecognitionResult:
     image, boxes = render_text_image(text, font, spacing)
     hypotheses: List[List[SymbolHypothesis]] = []
     best_chars: List[str] = []
     for box in boxes:
         symbol_image = image.crop(box)
         features = compute_features(symbol_image)
-        candidates = compute_symbol_hypotheses(features, prototypes)
+        profile = compute_profile_sequence(symbol_image)
+        candidates = compute_symbol_hypotheses(
+            features,
+            profile,
+            prototypes,
+            use_profiles=use_profiles,
+            profile_weight=profile_weight,
+        )
         hypotheses.append(candidates)
         best_chars.append(candidates[0].char if candidates else "?")
     prediction = "".join(best_chars)
@@ -156,6 +236,21 @@ def run_recognition(text: str, prototypes: List[SymbolPrototype], font: ImageFon
 
 
 def levenshtein(source: str, target: str) -> int:
+    if len(source) < len(target):
+        source, target = target, source
+    previous = list(range(len(target) + 1))
+    for i, sc in enumerate(source, 1):
+        current = [i]
+        for j, tc in enumerate(target, 1):
+            insert_cost = current[-1] + 1
+            delete_cost = previous[j] + 1
+            replace_cost = previous[j - 1] + (0 if sc == tc else 1)
+            current.append(min(insert_cost, delete_cost, replace_cost))
+        previous = current
+    return previous[-1]
+
+
+def levenshtein_seq(source: Sequence[int], target: Sequence[int]) -> int:
     if len(source) < len(target):
         source, target = target, source
     previous = list(range(len(target) + 1))
@@ -206,6 +301,8 @@ def main() -> None:
     parser.add_argument("--variation-font-size", "-v", type=int, default=86, help="размер шрифта для эксперимента")
     parser.add_argument("--font-path", "-f", default="", help="путь к файлу шрифта (опционально)")
     parser.add_argument("--output-dir", "-o", type=Path, default=Path("outputs"), help="куда сохранять файлы")
+    parser.add_argument("--use-profiles", action="store_true", help="добавить сравнение профилей (Левенштейн)")
+    parser.add_argument("--profile-weight", type=float, default=0.35, help="вес профиля в итоговой близости")
     args = parser.parse_args()
     base_spacing = max(2, args.font_size // 4)
     variant_spacing = max(2, args.variation_font_size // 4)
@@ -213,8 +310,22 @@ def main() -> None:
     base_font = load_font(args.font_size, args.font_path or None)
     variant_font = load_font(args.variation_font_size, args.font_path or None)
     prototypes = build_prototypes(args.alphabet, base_font)
-    base_result = run_recognition(args.text, prototypes, base_font, base_spacing)
-    variant_result = run_recognition(args.text, prototypes, variant_font, variant_spacing)
+    base_result = run_recognition(
+        args.text,
+        prototypes,
+        base_font,
+        base_spacing,
+        use_profiles=args.use_profiles,
+        profile_weight=args.profile_weight,
+    )
+    variant_result = run_recognition(
+        args.text,
+        prototypes,
+        variant_font,
+        variant_spacing,
+        use_profiles=args.use_profiles,
+        profile_weight=args.profile_weight,
+    )
     base_png = args.output_dir / "base_render.png"
     variant_png = args.output_dir / "variation_render.png"
     base_result.image.save(base_png)

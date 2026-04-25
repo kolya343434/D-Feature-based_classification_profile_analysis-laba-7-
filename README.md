@@ -103,15 +103,6 @@ python src/profile_classifier.py --text "приветмир" --font-size 52 --va
 
 ---
 
-## Примеры изображений со SlavCorpora (для иллюстрации источника)
-
-Изображения скачиваются с `https://www.slavcorpora.ru` (пример рукописи: `/manuscripts/856066a1-8663-4e31-9fbf-b740ab965c8c`).
-
-| Пример 1 | Пример 2 | Пример 3 |
-|---|---|---|
-| ![](assets/slavcorpora_1.jpeg) | ![](assets/slavcorpora_2.jpeg) | ![](assets/slavcorpora_3.jpeg) |
-
----
 
 ## Структура проекта
 
